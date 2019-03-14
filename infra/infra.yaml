@@ -1,0 +1,331 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  Owner:
+    Type: String
+    Default: "xerobusiness.skynet@xero.com"
+  Product:
+    Type: String
+    Default: "data.automation"
+  Portfolio:
+    Type: String
+    Default: "expense"
+  TaskImage:
+      Type: String
+  CellName:
+    Type: String
+    Default: "global"
+  HostedZoneName:
+    Type: String
+  Environment:
+    Type: String
+  TownClock:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /TownClock
+    Description: Dummy parameter to keep things updating.
+  StatsDHost:
+    Type: String
+    Default: "172.17.0.1"
+  StatsDPort:
+    Type: String
+    Default: "8125"
+  SubProduct:
+    Type: String
+    Default: "AccountCode"
+  Name:
+    Type: String
+    Default: {{.ProductName}}
+  ApiWorkerCount:
+    Type: Number
+    Default: 1
+  LogLevel:
+    Type: String
+    Default: "INFO"
+  TaskContainerPort:
+    Type: String
+    Default: 8000
+  PStorePathPrefix:
+    Type: String
+    Default: "/skynet/documatch/"
+  XeroFileServiceAddress:
+    Type: String
+  S3Kms:
+    Type: String
+  ModelsBucket:
+    Type: String
+
+Resources:
+
+  ModelApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: accountcode2-ecs
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+
+          - Resource:
+            - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PStorePathPrefix}*"
+            Action:
+            - ssm:GetParameters
+            - ssm:GetParameter
+            Effect: Allow
+
+          - Resource:
+              - !Ref S3Kms
+            Action:
+              - "kms:Encrypt"
+              - "kms:GenerateDataKey*"
+            Effect: "Allow"
+
+          - Resource:
+              - !GetAtt PredictionDeliveryStream.Arn
+            Effect: Allow
+            Action:
+              - firehose:PutRecordBatch
+
+
+  Cell:
+    Type: Custom::XeroCellInfo
+    Properties:
+      ServiceToken: !ImportValue XeroLambdaInvoker
+      XeroLambdaArn: smb-ecs-cfn-lambda
+      CellName: !Ref CellName
+      AppName: !Ref Name
+      Environment: !Ref Environment
+      OperatingSystem: linux
+      DummyProperty: !Ref TownClock # this actually gets ignored by the lambda but it's useful for Refreshing
+
+  ModelApiTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: accountcode2-predict
+      TaskRoleArn: !GetAtt ModelApiRole.Arn
+      Volumes: []
+      ContainerDefinitions:
+      - Name: api-container
+        Image: !Ref TaskImage
+        MemoryReservation: 256
+        LogConfiguration:
+          LogDriver: sumologic
+          Options:
+            sumo-source-category: !Sub ${Cell.SumoPrefix}/app/${Name}
+            sumo-url: !GetAtt Cell.SumoUrl
+        Environment:
+        - Name: XERO_ENV
+          Value: !Ref Environment
+        - Name: LOG_LEVEL
+          Value: !Ref LogLevel
+        - Name: AWS_DEFAULT_REGION
+          Value: !Ref AWS::Region
+        - Name: STATSD_HOST
+          Value: !Ref StatsDHost
+        - Name: STATSD_PORT
+          Value: !Ref StatsDPort
+        - Name: PSTORE_VISION_OCR_CREDENTIAL
+          Value: !Sub ${PStorePathPrefix}google-vision-credential
+        - Name: FILE_SERVICE_API
+          Value: !Ref XeroFileServiceAddress
+        - Name: FIREHOSE_STREAM
+          Value: !Ref PredictionDeliveryStream
+        - Name: DISABLE_AUTH
+          Value: True
+        - Name: API_WORKERS
+          Value: !Ref ApiWorkerCount
+        - Name: S3Kms
+          Value: !Ref S3Kms
+        - Name: S3_BUCKET
+          Value: !Ref ModelsBucket
+        PortMappings:
+        - ContainerPort: !Ref TaskContainerPort
+        DockerLabels:
+          com.xero.portfolio: !Ref Portfolio
+          com.xero.product: !Ref Product
+          com.xero.owner: !Ref Owner
+          com.xero.subproduct: !Ref SubProduct
+
+  ModelApiService:
+    Type: AWS::ECS::Service
+    DependsOn:
+    - ApiTargetGroup
+    - HttpsListener
+    Properties:
+      Cluster: !GetAtt Cell.EcsCluster
+      DesiredCount: 1
+      PlacementStrategies:
+      - Type: spread
+        Field: instanceId
+      PlacementConstraints:
+      - Type: memberOf
+        Expression: !Sub attribute:cell == ${CellName}
+      LoadBalancers:
+      - ContainerName: api-container
+        ContainerPort: !Ref TaskContainerPort
+        TargetGroupArn: !Ref ApiTargetGroup
+      TaskDefinition: !Ref ModelApiTask
+      Role: !GetAtt Cell.EcsServiceRole
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 200
+
+  ApiLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      SecurityGroups: !GetAtt Cell.LoadBalancerSecurityGroups
+      Subnets: !GetAtt Cell.LoadBalancerSubnets
+      Tags:
+      - Key: env.cell
+        Value: !Ref CellName
+      - Key: env.name
+        Value: !Ref Environment
+      - Key: portfolio
+        Value: !Ref Portfolio
+      - Key: product
+        Value: !Ref Product
+      - Key: name
+        Value: !Ref Name
+      - Key: owner
+        Value: !Ref Owner
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApiLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+      - CertificateArn: !GetAtt Cell.SslCertificateArn
+      DefaultActions:
+      - TargetGroupArn: !Ref ApiTargetGroup
+        Type: forward
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApiLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+      - TargetGroupArn: !Ref ApiTargetGroup
+        Type: forward
+  ApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn:
+    - ApiLoadBalancer
+    Properties:
+      Port: !Ref TaskContainerPort
+      HealthCheckPath: /healthcheck
+      Protocol: HTTP
+      VpcId: !GetAtt Cell.VpcId
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: "30"
+      Tags:
+      - Key: env.cell
+        Value: !Ref CellName
+      - Key: env.name
+        Value: !Ref Environment
+      - Key: portfolio
+        Value: !Ref Portfolio
+      - Key: product
+        Value: !Ref Product
+      - Key: name
+        Value: !Ref Name
+      - Key: owner
+        Value: !Ref Owner
+  ApiRecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Sub ${HostedZoneName}.
+      Name: !Sub ${Name}.${HostedZoneName}
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt ApiLoadBalancer.CanonicalHostedZoneID
+        DNSName: !GetAtt ApiLoadBalancer.DNSName
+
+
+  # Bucket for results and token storage for performance analysis
+  AnalysisBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Name}-results-${Environment}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref S3Kms
+              SSEAlgorithm: aws:kms
+      Tags:
+        - Key: portfolio
+          Value: !Ref Portfolio
+        - Key: product
+          Value: !Ref Product
+        - Key: owner
+          Value: !Ref Owner
+
+  # Kinesis Firehose delivery stream to get prediction requests and results into S3
+  FirehoseAuditingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub firehose-${Environment}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+
+      Policies:
+        - PolicyName: !Sub ${Name}-firehose-${Environment}
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              - Resource:
+                  - !Ref S3Kms
+                Action:
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Effect: Allow
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "s3.${AWS::Region}.amazonaws.com"
+                  StringLike:
+                    kms:EncryptionContext:aws:s3:arn: !Sub "${AnalysisBucket.Arn}/*"
+
+              - Resource:
+                  - !GetAtt AnalysisBucket.Arn
+                  - !Sub "${AnalysisBucket.Arn}/*"
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Effect: Allow
+
+  PredictionDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt AnalysisBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        CompressionFormat: GZIP
+        EncryptionConfiguration:
+          KMSEncryptionConfig:
+            AWSKMSKeyARN: !Ref S3Kms
+        RoleARN: !GetAtt FirehoseAuditingRole.Arn
+
